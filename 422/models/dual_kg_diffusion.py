@@ -11,16 +11,13 @@ from models.MISCFilterNet_Deform import MISCKernelNet_Deform as MISCDeformNet
 def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
 
-
 def _add_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k if k.startswith("module.") else f"module.{k}": v for k, v in state_dict.items()}
-
 
 def _extract_state_dict(ckpt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         return ckpt["state_dict"]
     return ckpt
-
 
 def _load_expert_weights(model: nn.Module, weights_path: str, device: torch.device) -> None:
     ckpt = torch.load(weights_path, map_location=device)
@@ -39,16 +36,13 @@ def _load_expert_weights(model: nn.Module, weights_path: str, device: torch.devi
     if unexpected:
         print(f"[DualKG] Unexpected keys while loading {weights_path}: {len(unexpected)}")
 
-
 def _freeze_model(model: nn.Module) -> None:
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
 
-
 def _flow_at(flows: Sequence[torch.Tensor], idx: int) -> Optional[torch.Tensor]:
     return flows[idx] if len(flows) > idx else None
-
 
 def _to_neg_one_to_one(x: torch.Tensor) -> torch.Tensor:
     if x.ndim <= 1:
@@ -65,7 +59,6 @@ def _to_neg_one_to_one(x: torch.Tensor) -> torch.Tensor:
     scaled = x * 2.0 - 1.0
     clipped = torch.clamp(x, -1.0, 1.0)
     return torch.where(in_zero_one, scaled, clipped)
-
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
     if dim < 2:
@@ -178,12 +171,17 @@ class ResidualTimeBlock(nn.Module):
 
 
 class SimpleCondUNet(nn.Module):
+    """
+    条件 UNet，支持可选的多尺度融合特征残差注入。
+    若不给 extra_condition_channels，则完全等同于原版。
+    """
     def __init__(
         self,
         in_channels: int = 3,
         cond_channels: int = 6,
         base_channels: int = 64,
         t_embed_dim: int = 128,
+        extra_condition_channels: Optional[List[int]] = None,  # ★ 新增
     ) -> None:
         super().__init__()
         self.t_embed_dim = t_embed_dim
@@ -210,6 +208,16 @@ class SimpleCondUNet(nn.Module):
         self.mod2 = KinematicModulation(base_channels * 2, flow_channels=2)
         self.mod3 = KinematicModulation(base_channels * 2, flow_channels=2)
 
+        # ★ 新增：多尺度融合特征投影层
+        if extra_condition_channels is not None:
+            # 两个投影层，分别对应 skip2 (e2, base*2) 和 skip1 (e1, base)
+            self.extra_projections = nn.ModuleList([
+                nn.Conv2d(extra_condition_channels[0], base_channels * 2, 1),
+                nn.Conv2d(extra_condition_channels[1], base_channels, 1),
+            ])
+        else:
+            self.extra_projections = None
+
     @staticmethod
     def _resize_flow(flow: Optional[torch.Tensor], target: torch.Tensor) -> Optional[torch.Tensor]:
         if flow is None:
@@ -224,6 +232,7 @@ class SimpleCondUNet(nn.Module):
         timestep: torch.Tensor,
         cond_img: torch.Tensor,
         flows: Optional[Sequence[torch.Tensor]] = None,
+        extra_condition: Optional[List[torch.Tensor]] = None,  # ★ 新增
     ) -> torch.Tensor:
         if timestep.dim() == 0:
             timestep = timestep.unsqueeze(0)
@@ -241,6 +250,7 @@ class SimpleCondUNet(nn.Module):
         x = torch.cat([noisy_latent, cond_img], dim=1)
         x0 = self.input_proj(x)
 
+        # ---- encoder ----
         e1 = self.enc1(x0, t_emb)
         e1 = self.mod1(e1, self._resize_flow(f1, e1))
 
@@ -251,12 +261,28 @@ class SimpleCondUNet(nn.Module):
         m = self.mid(e2, t_emb)
         m = self.mod3(m, self._resize_flow(f3, m))
 
-        low = torch.cat([m, e2], dim=1)  # [B, 4*base_channels, H/2, W/2] = [B, 2C + 2C, ...].
+        # ★ 新增：在 skip2 (e2) 处注入融合特征
+        if self.extra_projections is not None and extra_condition is not None and len(extra_condition) > 0:
+            cond = extra_condition[0]
+            if cond.shape[-2:] != e2.shape[-2:]:
+                cond = F.interpolate(cond, size=e2.shape[-2:], mode='bilinear', align_corners=False)
+            e2 = e2 + self.extra_projections[0](cond)
+
+        # ---- decoder ----
+        low = torch.cat([m, e2], dim=1)
         low = self.dec_low(low, t_emb)
 
         u = self.up(low)
         if u.shape[-2:] != e1.shape[-2:]:
-            u = F.interpolate(u, size=e1.shape[-2:], mode="bilinear", align_corners=False)
+            u = F.interpolate(u, size=e1.shape[-2:], mode='bilinear', align_corners=False)
+
+        # ★ 新增：在 skip1 (e1) 处注入融合特征
+        if self.extra_projections is not None and extra_condition is not None and len(extra_condition) > 1:
+            cond = extra_condition[1]
+            if cond.shape[-2:] != e1.shape[-2:]:
+                cond = F.interpolate(cond, size=e1.shape[-2:], mode='bilinear', align_corners=False)
+            e1 = e1 + self.extra_projections[1](cond)
+
         u = torch.cat([u, e1], dim=1)
         u = self.dec_high(u, t_emb)
         u = self.refine(u, t_emb)
